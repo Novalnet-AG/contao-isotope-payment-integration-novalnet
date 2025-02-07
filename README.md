@@ -2,7 +2,7 @@
 Novalnet’s Payment Bundle ensures simple and secure integration of payments and payment services for Contao-Isotope shops, allowing shop owners to automate the entire payment process from checkout till collection. 
 
 ## Integration requirements 
-Novalnet merchant account is required for using this Novalnet Payment Bundle for Contao-Isotope. The bundle is available for Contao versions 4.10.4, Isotope versions 2.6.14 in the following languages: EN & DE
+Novalnet merchant account is required for using this Novalnet Payment Bundle for Contao-Isotope. The bundle is available for Contao versions 4.13.52, Isotope versions 2.9.6 in the following languages: EN & DE
 
 ## Advanced functions for payment processing
 -	Easy configuration of international and local payment methods
