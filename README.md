@@ -1,4 +1,4 @@
-# NOVALNET PAYMENT INTEGRATION FOR Contao-Isotope
+# Novalnet Payment Integration for Contao-Isotope
 Novalnet’s Payment Bundle ensures simple and secure integration of payments and payment services for Contao-Isotope shops, allowing shop owners to automate the entire payment process from checkout till collection. 
 
 ## Integration requirements 
