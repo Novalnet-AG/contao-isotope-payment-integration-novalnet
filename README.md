@@ -35,7 +35,7 @@ For detailed documentation and other technical inquiries, please send us an emai
 -	TWINT
 
 ## Compatibility
-Contao-Isotope payment plugin is compatible with below technical capabilities. 
+Contao-Isotope payment bundle is compatible with below technical capabilities. 
 - [x]	Contao versions 4.13.52 - 4.13.56
 - [x]	Isotope versions 2.9.6 - 2.9.7
 - [x]	Linux based OS with Apache 2.2 or 2.4
