@@ -1,0 +1,676 @@
+<?php
+
+declare(strict_types=1);
+
+
+/**
+ * Novalnet webhook
+ *
+ * This module is used for real time processing
+ * of Novalnet transaction of customers.
+ *
+ * This free contribution made by request
+ * If you have found this script useful a small
+ * recommendation as well as a comment on merchant form
+ * would be greatly appreciated
+ *
+ * @package Novalnet
+ * @author Novalnet AG
+ * @copyright Copyright by Novalnet
+ * @license https://novalnet.de/payment-plugins/kostenlos/lizenz
+ *
+ */
+
+namespace NovalnetGateway\IsotopeNovalnetBundle\Callback;
+
+use Contao\File;
+use Contao\CoreBundle\Exception\RedirectResponseException;
+use Contao\Module;
+use Contao\System;
+use Isotope\Isotope;
+use Isotope\Module\Checkout;
+use Symfony\Component\HttpFoundation\Request;
+use Isotope\Model\Payment\Postsale;
+use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
+use Symfony\Component\Routing\RouterInterface;
+use Haste\Input\Input;
+use NovalnetGateway\IsotopeNovalnetBundle\Helper\NovalnetHelper;
+use NotificationCenter\Gateway\Email;
+
+class NovalnetWebHook
+{
+    /**
+     * Allowed host from Novalnet.
+     *
+     * @var string
+     */
+    protected $novalnetHostName = 'pay-nn.de';
+
+    /**
+    * @var string
+    */
+    protected $eventType;
+
+    /**
+     * @var int
+     */
+    protected $orderStatus;
+
+    /**
+     * @var int
+     */
+    protected $parentTid;
+
+    /**
+     * @var int
+     */
+    protected $eventTid;
+
+    /**
+    * @var object
+    */
+    protected $orderReference;
+
+    /**
+     * @var int
+     */
+    protected $receivedAmount;
+
+    /**
+     * @var int
+     */
+    protected $orderId;
+
+    /**
+     * Mandatory Parameters.
+     *
+     * @var array
+     */
+    protected $mandatory = array(
+        'event'       => array(
+            'type',
+            'checksum',
+            'tid',
+        ),
+        'merchant'    => array(
+            'vendor',
+            'project',
+        ),
+        'result'      => array(
+            'status',
+        ),
+        'transaction' => array(
+            'tid',
+            'payment_type',
+            'status',
+        ),
+    );
+
+    /* Handle callback process
+     *
+     * @param array $eventData
+     * @param int $orderStatus
+     * @param object $order
+     * @return null
+     */
+    public function handleProcessPostsale($eventData, $orderStatus, $order)
+    {
+        $this->helper = new NovalnetHelper();
+        $requestReceivedIp = $this->checkWebhookIp();
+        $this->eventData = $eventData;
+        $config = $this->helper->getNovalnetGlobalConfig('novalnetglobalconfigWebhookTestMode');
+        $novalnetHostIp  = gethostbyname($this->novalnetHostName);
+        if (!empty($novalnetHostIp)) {
+            if(empty($requestReceivedIp) && empty($config->novalnetglobalconfigWebhookTestMode)) {
+                $this->displayMessage(['message' => 'Unauthorised access from the IP ' . $_SERVER['HTTP_X_FORWARDED_FOR'] ?: $_SERVER['HTTP_X_REAL_IP'] ?: $_SERVER['REMOTE_ADDR']]);
+            }
+        } else {
+            $this->displayMessage(['message' => 'Unauthorised access from the IP. Novalnet Host name is empty']);
+        }
+
+        // Get request parameters.
+        $this->validateEventData();
+
+        // Set Event data
+        $this->eventType = $this->eventData['event']['type'];
+
+        $this->orderStatus = $orderStatus;
+
+        $this->parentTid = !empty($this->eventData['event']['parent_tid']) ? $this->eventData['event']['parent_tid'] : $this->eventData['event']['tid'];
+
+        $this->eventTid  = $this->eventData['event']['tid'];
+
+        // Get order reference.
+        $this->orderReference = $this->getOrderReference($order);
+
+        $this->receivedAmount = sprintf('%0.2f', $this->eventData['transaction']['amount'] / 100);
+
+        $this->orderId  = $this->eventData['transaction']['order_no'] ? $this->eventData['transaction']['order_no'] : $this->orderReference['order_no'];
+
+        if (!empty($this->eventData['result']['status']) && $this->eventData['result']['status'] == 'SUCCESS') {
+
+            switch ($this->eventType) {
+                case 'PAYMENT':
+                    $this->displayMessage([ 'message' => 'The Payment has been received']);
+                    break;
+
+                case 'TRANSACTION_CAPTURE':
+                case 'TRANSACTION_CANCEL':
+                    $this->handleTransactionCaptureCancel($order);
+                    break;
+                case 'TRANSACTION_REFUND':
+                    $this->handleTransactionRefund($order);
+                    break;
+                case 'TRANSACTION_UPDATE':
+                    $this->handleTransactionUpdate($order);
+                    break;
+                case 'CREDIT':
+                    $this->handleCredit($order);
+                    break;
+                case 'CHARGEBACK':
+                    $this->handleChargeback();
+                    break;
+                case 'INSTALMENT':
+                    $this->handleInstalment($order);
+                    break;
+            }
+        } else {
+            $this->displayMessage(['message' => 'Novalnet Callback executed. The transaction status is not valid!']);
+        }
+    }
+
+    /* Validate event data
+     *
+     * @return null
+     */
+    public function validateEventData()
+    {
+        // Validate required parameter
+        foreach ($this->mandatory as $category => $parameters) {
+            if (empty($this->eventData[$category])) {
+                // Could be a possible manipulation in the notification data
+                $this->displayMessage(['message' => "Required parameter category($category) not received" ]);
+            } elseif (!empty($parameters)) {
+                foreach ($parameters as $parameter) {
+                    if (empty($this->eventData[$category][$parameter])) {
+                        // Could be a possible manipulation in the notification data
+                        $this->displayMessage(['message' => "Required parameter($parameter) in the category($category) not received"]);
+                    } elseif (in_array($parameter, array('tid', 'parent_tid')) && !preg_match('/^\d{17}$/', (string) $this->eventData[$category][$parameter])) {
+                        $this->displayMessage(['message' => "Invalid TID received in the category($category) not received $parameter"]);
+                    }
+                }
+            }
+        }
+
+        // Validate the received checksum.
+        $this->validateChecksum();
+
+        // Validate TID's from the event data
+        if (!preg_match('/^\d{17}$/', (string) $this->eventData['event']['tid'])) {
+            $this->displayMessage(['message' => "Invalid event TID: " . $this->eventData['event']['tid'] . " received for the event(". $this->eventData['event']['type'] .")"]);
+        } elseif (!empty($this->eventData['event']['parent_tid']) && $this->eventData['event']['parent_tid'] && !preg_match('/^\d{17}$/', (string) $this->eventData['event']['parent_tid'])) {
+            $this->displayMessage(['message' => "Invalid event TID: " . $this->eventData['event']['parent_tid'] . " received for the event(". $this->eventData['event']['type'] .")"]);
+        }
+    }
+
+    /**
+     * Get user remote ip address
+     *
+     * @return bool
+     */
+    public function checkWebhookIp()
+    {
+        $ipKeys = ['HTTP_X_FORWARDED_HOST', 'HTTP_CLIENT_IP', 'HTTP_X_REAL_IP', 'HTTP_X_FORWARDED_FOR', 'HTTP_X_FORWARDED', 'HTTP_X_CLUSTER_CLIENT_IP', 'HTTP_FORWARDED_FOR', 'HTTP_FORWARDED', 'REMOTE_ADDR'];
+        $novalnetHostIp = gethostbyname($this->novalnetHostName);
+        $server = $_SERVER;
+
+        foreach ($ipKeys as $key) {
+            if (array_key_exists($key, $server) === true) {
+                if (in_array($key, ['HTTP_X_FORWARDED_HOST', 'HTTP_X_FORWARDED_FOR'])) {
+                    $forwardedIps = (!empty($server[$key])) ? explode(",", $server[$key]) : [];
+                    if (in_array($novalnetHostIp, $forwardedIps)) {
+                        return true;
+                    }
+                }
+
+                if ($server[$key] ==  $novalnetHostIp) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+    * Validate checksum
+    *
+    * @return void
+    */
+    protected function validateChecksum()
+    {
+        $tokenString  = $this->eventData['event']['tid'] . $this->eventData['event']['type'] . $this->eventData['result']['status'];
+
+        if (isset($this->eventData['transaction']['amount'])) {
+            $tokenString .= $this->eventData['transaction']['amount'];
+        }
+        if (isset($this->eventData['transaction']['currency'])) {
+            $tokenString .= $this->eventData['transaction']['currency'];
+        }
+        $config = $this->helper->getNovalnetGlobalConfig('novalnetglobalconfigAccessKey');
+        if (!empty($config->novalnetglobalconfigAccessKey)) {
+            $tokenString .= strrev($config->novalnetglobalconfigAccessKey);
+        }
+        $generatedChecksum = hash('sha256', $tokenString);
+        if (hash_equals($generatedChecksum, $this->eventData['event']['checksum']) == false) {
+            $this->displayMessage(['message' => "While notifying some data has been changed. The hash check failed"]);
+        }
+    }
+
+    /**
+    * Get order details
+    *
+    * @param object $order
+    *
+    * @return array
+    */
+    public function getOrderReference($order)
+    {
+        $paymentData = \Database::getInstance()->prepare("SELECT document_number, payment_data FROM tl_iso_product_collection WHERE id=?")->execute($order->getId());
+
+        if (!empty($paymentData->payment_data)) {
+            $unSerializeData = json_decode($paymentData->payment_data, true);
+            $unSerializeData['order_no'] = $paymentData->document_number;
+            $responseOrderNo = $this->eventData['transaction']['order_no'];
+
+            if (!empty($responseOrderNo) && ($paymentData->document_number != $responseOrderNo)) {
+                $this->displayMessage(['message' => "Order reference not matching"]);
+            }
+
+            return $unSerializeData;
+        } elseif ($this->eventType === 'PAYMENT' && empty($paymentData->payment_data)) { // Handle the communication break
+            $this->handleCommunicationFailure($order);
+        } else {
+            $this->displayMessage(['message' => "Order reference not exist in the database!"]);
+        }
+    }
+
+    /**
+     * Handle transaction capture/cancel
+     *
+     * @param object $order
+     *
+     * @return null
+     */
+    public function handleCommunicationFailure($order)
+    {
+        $comments = specialchars($GLOBALS['TL_LANG']['MSC']['nn_transaction_id']) . $this->eventData['transaction']['tid'] . PHP_EOL;
+        $comments .= ($this->eventData['transaction']['test_mode'] == '1') ? specialchars($GLOBALS['TL_LANG']['MSC']['nn_test_mode']) . PHP_EOL : '';
+
+        $paymentData = array(
+            'tid' => $this->eventData['transaction']['tid'],
+            'status' => $this->eventData['transaction']['status'],
+            'payment_type' => $this->eventData['transaction']['payment_type'],
+            'amount' => $this->eventData['transaction']['amount'],
+            'email' => $this->eventData['customer']['email'],
+            'paid_amount' => in_array($this->eventData['transaction']['payment_type'], array('INVOICE', 'PREPAYMENT', 'MULTIBANCO')) ? '0' : $this->eventData['transaction']['amount']
+        );
+
+        if ($this->eventData['result']['status'] == 'SUCCESS') { // coding for success transactions
+            if (!empty($this->eventData['transaction']['payment_data']['token'])) {
+                $paymentData['token'] = $this->eventData['transaction']['payment_data']['token'];
+            }
+
+            if ($this->eventData['transaction']['status'] == 'PENDING') {
+                $orderStatus = !empty($this->helper->getNovalnetGlobalConfig('novalnetglobalconfigPendingOrderStatus')->novalnetglobalconfigPendingOrderStatus) ? $this->helper->getNovalnetGlobalConfig('novalnetglobalconfigPendingOrderStatus')->novalnetglobalconfigPendingOrderStatus : '1';
+            } elseif ($this->eventData['transaction']['status'] == 'ON_HOLD') {
+                $orderStatus = !empty($this->helper->getNovalnetGlobalConfig('novalnetglobalconfigHoldOrderStatus')->novalnetglobalconfigHoldOrderStatus) ? $this->helper->getNovalnetGlobalConfig('novalnetglobalconfigHoldOrderStatus')->novalnetglobalconfigHoldOrderStatus : '4';
+            } else {
+                $orderStatus = $this->orderStatus;
+            }
+        } else {
+            $message = $this->eventData['result'];
+            $comments .= !empty($message['status_desc']) ? $message['status_desc'] : (!empty($message['status_text']) ? $message['status_text'] : (!empty($message['status_message']) ? $message['status_message'] : '')) . PHP_EOL;
+
+            $orderStatus = !empty($this->helper->getNovalnetGlobalConfig('novalnetglobalconfigCancelledOrderStatus')->novalnetglobalconfigCancelledOrderStatus) ? $this->helper->getNovalnetGlobalConfig('novalnetglobalconfigCancelledOrderStatus')->novalnetglobalconfigCancelledOrderStatus : $order->getConfig()->orderstatus_error;
+        }
+
+        $currentNotification    =   $order->nc_notification;
+        $order->nc_notification =   null;
+        $order->checkout();
+        $checkoutInfo = deserialize($order->checkout_info);
+        $checkoutInfo['payment_method']['info'] .= '<br>'.nl2br($comments);
+        $order->checkout_info =   serialize($checkoutInfo);
+        $order->updateOrderStatus($orderStatus);
+
+        // update order number to the novalnet server
+        $transactionDetails['transaction'] = array(
+            'tid'      => $this->eventData['transaction']['tid'],
+            'order_no' => $order->getDocumentNumber() ?: $order->getId(),
+        );
+        $this->helper->sendCurlRequest('https://payport.novalnet.de/v2/transaction/update', $transactionDetails);
+
+        $order->payment_data = json_encode($paymentData);
+        $order->save();
+        $this->helper->sendNotification($order, $currentNotification);
+        $this->displayMessage(['message' => 'Communication failure has been handled successfully. The transaction details has been updated']);
+    }
+
+    /**
+     * Handle transaction capture/cancel
+     *
+     * @param object $order
+     *
+     * @return null
+     */
+    public function handleTransactionCaptureCancel($order)
+    {
+        if (in_array($this->orderReference['status'], ['ON_HOLD', 'PENDING'])) {
+            if ($this->eventType == 'TRANSACTION_CAPTURE') {
+                if ($this->eventData['transaction']['payment_type'] === 'INVOICE') {
+                    $this->eventData['transaction']['status'] = 'PENDING';
+                }
+
+                $orderStatus = $this->orderStatus;
+                $comments = PHP_EOL. PHP_EOL. sprintf(specialchars($GLOBALS['TL_LANG']['MSC']['nn_webhook_transaction_confirm']), date('Y-m-d H:i:s')).PHP_EOL;
+
+                if (in_array($this->eventData['transaction']['payment_type'], array('INSTALMENT_INVOICE', 'INSTALMENT_DIRECT_DEBIT_SEPA'))) {
+                    $this->orderReference['instalment_details'] = $this->helper->getInstalmentData($this->eventData);
+                }
+
+                if (in_array($this->eventData['transaction']['payment_type'], array('INVOICE', 'GUARANTEED_INVOICE', 'INSTALMENT_INVOICE'))) {
+                    $comments .= sprintf(specialchars($GLOBALS['TL_LANG']['MSC']['nn_webhook_transfer_amount']), $this->receivedAmount, $this->eventData['transaction']['currency'], $this->eventData['transaction']['due_date']).PHP_EOL;
+                }
+
+                if ($this->eventData['transaction']['status'] == 'CONFIRMED') {
+                    $this->orderReference['paid_amount'] = $this->eventData['transaction']['amount'];
+                }
+            } elseif ($this->eventType == 'TRANSACTION_CANCEL') {
+                $comments = PHP_EOL.sprintf(specialchars($GLOBALS['TL_LANG']['MSC']['nn_webhook_transaction_cancel']), date('Y-m-d H:i:s')).PHP_EOL;
+                $orderStatus = !empty($this->helper->getNovalnetGlobalConfig('novalnetglobalconfigCancelledOrderStatus')->novalnetglobalconfigCancelledOrderStatus) ? $this->helper->getNovalnetGlobalConfig('novalnetglobalconfigCancelledOrderStatus')->novalnetglobalconfigCancelledOrderStatus : $order->getConfig()->orderstatus_error;
+            }
+
+            $this->orderReference['status'] = $this->eventData['transaction']['status'];
+
+            \Database::getInstance()->query(
+                'UPDATE tl_iso_product_collection SET notes = CONCAT(IF(notes IS NULL, "", notes), "' . $comments . '") WHERE document_number ="' . $this->orderId . '"'
+            );
+            $order->updateOrderStatus($orderStatus);
+            $order->payment_data = json_encode($this->orderReference);
+            $order->save();
+            $this->sendWebhookMail($comments);
+            $this->displayMessage(['message' => $comments]);
+        } else {
+            $this->displayMessage(['message' => 'The transaction is already captured.']);
+        }
+    }
+
+    /**
+     * Handle transaction refund
+     *
+     * @return null
+     */
+    public function handleTransactionRefund($order)
+    {
+        global $objPage;
+
+        if (!empty($this->eventData['transaction']['refund']['amount'])) {
+            $refundAmount = $this->eventData['transaction']['refund']['amount'];
+        } else {
+            $refundAmount = $this->orderReference['amount'] - $this->orderReference['refunded_amount'];
+        }
+
+        if (!empty($refundAmount)) {
+            $currency = !empty($this->eventData['transaction']['refund']['currency']) ? $this->eventData['transaction']['refund']['currency'] : $this->eventData['transaction']['currency'];
+            $comments = sprintf(specialchars($GLOBALS['TL_LANG']['MSC']['nn_webhook_refund_parent_tid']), $this->parentTid, $refundAmount, $currency).PHP_EOL;
+
+            $this->orderReference['status'] = $this->eventData['transaction']['status'];
+            $this->orderReference['refunded_amount'] = $refundAmount;
+
+            if (!empty($this->eventData['transaction']['refund']['tid'])) {
+                $commentsEn = sprintf(specialchars($GLOBALS['TL_LANG']['MSC']['nn_webhook_refund_child_tid']), $this->parentTid, $this->receivedAmount, $currency, $this->eventData['transaction']['refund']['tid'], sprintf('%0.2f', $refundAmount / 100), $currency).PHP_EOL;
+
+                $commentsDe = sprintf(specialchars($GLOBALS['TL_LANG']['MSC']['nn_webhook_refund_child_tid']), $this->parentTid, $this->receivedAmount, $currency, sprintf('%0.2f', $refundAmount / 100), $currency, $this->eventData['transaction']['refund']['tid']).PHP_EOL;
+                $comments = ($objPage->rootLanguage == 'de') ? $commentsDe : $commentsEn;
+            }
+
+            $totalRefundedAmount = $this->orderReference['refunded_amount'] + $refundAmount;
+
+            \Database::getInstance()->query(
+                'UPDATE tl_iso_product_collection SET notes = CONCAT(IF(notes IS NULL, "", notes), "' . $comments . '") WHERE document_number ="' . $this->orderId . '"'
+            );
+
+            if ($totalRefundedAmount >= $this->orderReference['amount']) {
+                $orderStatus = !empty($this->helper->getNovalnetGlobalConfig('novalnetglobalconfigCancelledOrderStatus')->novalnetglobalconfigCancelledOrderStatus) ? $this->helper->getNovalnetGlobalConfig('novalnetglobalconfigCancelledOrderStatus')->novalnetglobalconfigCancelledOrderStatus : $order->getConfig()->orderstatus_error;
+                $order->updateOrderStatus($orderStatus);
+            }
+            $order->payment_data = json_encode($this->orderReference);
+            $order->save();
+            $this->sendWebhookMail($comments);
+            $this->displayMessage(['message' => $comments]);
+        } else {
+            $this->displayMessage(['message' => 'The full amount has already been refunded.']);
+        }
+    }
+
+    /**
+     * Handle transaction update
+     *
+     * @param object $order
+     * @return null
+     */
+    public function handleTransactionUpdate($order)
+    {
+        $orderStatus = $comments = '';
+
+        if (in_array($this->eventData['transaction']['status'], array('PENDING', 'ON_HOLD', 'CONFIRMED', 'DEACTIVATED'))) {
+            if (in_array($this->eventData['transaction']['update_type'], ['DUE_DATE', 'AMOUNT_DUE_DATE'])) {
+                $this->orderReference['amount'] = $this->eventData['transaction']['amount'];
+
+                $dueDate = date('d-m-Y', strtotime($this->eventData['transaction']['due_date']));
+
+                $comments = PHP_EOL . sprintf(specialchars($GLOBALS['TL_LANG']['MSC']['nn_webhook_transfer_update']), $this->receivedAmount, $this->eventData['transaction']['currency'], $dueDate).PHP_EOL;
+            } elseif ($this->eventData['transaction']['update_type'] === 'STATUS') {
+                if ($this->eventData['transaction']['status']  == 'DEACTIVATED') {
+                    $this->orderReference['status'] = $this->eventData['transaction']['status'];
+                    $comments = PHP_EOL . sprintf(specialchars($GLOBALS['TL_LANG']['MSC']['nn_webhook_transaction_cancel']), date('Y-m-d H:i:s')).PHP_EOL;
+                    $orderStatus = !empty($this->helper->getNovalnetGlobalConfig('novalnetglobalconfigCancelledOrderStatus')->novalnetglobalconfigCancelledOrderStatus) ? $this->helper->getNovalnetGlobalConfig('novalnetglobalconfigCancelledOrderStatus')->novalnetglobalconfigCancelledOrderStatus : $order->getConfig()->orderstatus_error;
+                } else {
+                    if ($this->orderReference['status'] !== 'CONFIRMED') {
+                        if (in_array($this->eventData['transaction']['payment_type'], ['GUARANTEED_INVOICE', 'INSTALMENT_INVOICE', 'INVOICE', 'GUARANTEED_DIRECT_DEBIT_SEPA', 'INSTALMENT_DIRECT_DEBIT_SEPA'])) {
+                            $checkoutComments = specialchars($GLOBALS['TL_LANG']['MSC']['nn_transaction_id']) . $this->eventData['transaction']['tid'] . PHP_EOL;
+                            $checkoutComments .= ($this->eventData['transaction']['test_mode'] == '1') ? specialchars($GLOBALS['TL_LANG']['MSC']['nn_test_mode']) . PHP_EOL . PHP_EOL : '';
+                            $checkoutComments .= $this->helper->prepareComments($this->eventData, $this->orderId);
+                            $comments = $this->helper->prepareComments($this->eventData, $this->orderId, false) . PHP_EOL . PHP_EOL;
+                        }
+
+                        if (in_array($this->orderReference['payment_type'], array('INSTALMENT_INVOICE', 'INSTALMENT_DIRECT_DEBIT_SEPA')) && isset($this->eventData['instalment'])) {
+                            //instalment comments
+                            $this->orderReference['instalment_details'] = $this->helper->getInstalmentData($this->eventData);
+                        }
+
+                        if ($this->orderReference['status'] == 'PENDING' && $this->eventData['transaction']['status'] == 'ON_HOLD') {
+                            $comments .= sprintf(specialchars($GLOBALS['TL_LANG']['MSC']['nn_webhook_transaction_pending_to_onhold']), $this->eventTid, date('Y-m-d H:i:s')).PHP_EOL;
+                            $orderStatus = !empty($this->helper->getNovalnetGlobalConfig('novalnetglobalconfigHoldOrderStatus')->novalnetglobalconfigHoldOrderStatus) ? $this->helper->getNovalnetGlobalConfig('novalnetglobalconfigHoldOrderStatus')->novalnetglobalconfigHoldOrderStatus : 4;
+                            $this->orderReference['status'] = $this->eventData['transaction']['status'];
+                        } elseif ($this->eventData['transaction']['status'] == 'CONFIRMED' && $this->orderReference['status'] != 'CONFIRMED') {
+                            $orderStatus = $this->orderStatus;
+                            $comments .= sprintf(specialchars($GLOBALS['TL_LANG']['MSC']['nn_webhook_transaction_update']), $this->eventTid, $this->receivedAmount.' ' .$this->eventData['transaction']['currency'], date('Y-m-d H:i:s')).PHP_EOL;
+
+                            if (in_array($this->eventData['transaction']['payment_type'], ['PAYPAL', 'PRZELEWY24'])) {
+                                $comments = sprintf(specialchars($GLOBALS['TL_LANG']['MSC']['nn_webhook_redirection_update']), $this->eventTid, date('Y-m-d H:i:s')).PHP_EOL;
+                            }
+                            $this->orderReference['status'] = $this->eventData['transaction']['status'];
+                            $this->orderReference['paid_amount'] = $this->eventData['transaction']['amount'];
+                        }
+                    } else {
+                        $this->displayMessage(['message' => 'The transaction is already confirmed.']);
+                    }
+                }
+            } else {
+                if (!empty($this->eventData['transaction']['amount'])) {
+                    $this->orderReference['amount'] = $this->eventData['transaction']['amount'];
+                }
+                $comments .= sprintf(specialchars($GLOBALS['TL_LANG']['MSC']['nn_webhook_transaction_update']), $this->eventTid, $this->receivedAmount.' ' .$this->eventData['transaction']['currency'], date('Y-m-d H:i:s')).PHP_EOL;
+            }
+
+            if (!empty($checkoutComments) && in_array($this->eventData['transaction']['payment_type'], ['INVOICE', 'PREPAYMENT']) || (in_array($this->eventData['transaction']['payment_type'], ['INSTALMENT_INVOICE', 'GUARANTEED_INVOICE', 'INSTALMENT_DIRECT_DEBIT_SEPA', 'GUARANTEED_DIRECT_DEBIT_SEPA']) && in_array($this->eventData['transaction']['status'], ['ON_HOLD', 'CONFIRMED']))) {
+                $checkoutInfo = deserialize($order->checkout_info);
+                $checkoutInfo['payment_method']['info'] = nl2br($checkoutComments);
+                $order->checkout_info = serialize($checkoutInfo);
+            }
+
+            \Database::getInstance()->query(
+                'UPDATE tl_iso_product_collection SET notes = CONCAT(IF(notes IS NULL, "", notes), "' . $comments . '") WHERE document_number ="' . $this->orderId . '"'
+            );
+
+
+            if (!empty($orderStatus)) {
+                $order->updateOrderStatus($orderStatus);
+            }
+            $order->payment_data = json_encode($this->orderReference);
+            $order->save();
+            $this->sendWebhookMail($comments);
+            $this->displayMessage(['message' => $comments]);
+        }
+    }
+
+    /**
+    * Handle Credit event
+    *
+    * @param object $order
+    * @return null
+    */
+    public function handleCredit($order)
+    {
+        $comments = sprintf(specialchars($GLOBALS['TL_LANG']['MSC']['nn_online_transfer_credit']), $this->parentTid, $this->receivedAmount . ' ' . $this->eventData['transaction']['currency'], date('Y-m-d H:i:s'), $this->eventTid).PHP_EOL;
+
+        if (in_array($this->eventData['transaction']['payment_type'], array('INVOICE_CREDIT', 'MULTIBANCO_CREDIT', 'ONLINE_TRANSFER_CREDIT'))) {
+            $amountAlreadyPaid = $this->orderReference['paid_amount'];
+
+            if ($amountAlreadyPaid < $this->orderReference['amount']) {
+                $totalPaidAmount = $amountAlreadyPaid + $this->eventData['transaction']['amount'];
+                $this->orderReference['paid_amount'] = $totalPaidAmount;
+                if (((int) $totalPaidAmount >= (int) $this->orderReference['amount'])) {
+                    if ($this->orderReference['payment_type'] !== 'CASHPAYMENT') {
+                        $statusStatus = 'novalnet'.strtolower($this->orderReference['payment_type']).'CallbackOrderStatus';
+                        $paymentType = 'novalnet'.strtolower($this->orderReference['payment_type']);
+                        $callbackOrderStatus = \Database::getInstance()->execute("SELECT {$statusStatus} FROM tl_iso_payment WHERE type='$paymentType' AND enabled=1");
+                        $status = $callbackOrderStatus->$statusStatus;
+                    } else {
+                        $statusStatus = 'novalnetinvoiceCallbackOrderStatus';
+                        $paymentType = 'novalnetinvoice';
+                        $callbackOrderStatus = \Database::getInstance()->execute("SELECT {$statusStatus} FROM tl_iso_payment WHERE type='$paymentType' AND enabled=1");
+                        $status = $callbackOrderStatus->$statusStatus ?? $this->orderStatus;
+                    }
+                    $order->updateOrderStatus($status ?: $this->orderStatus);
+                }
+
+                $order->payment_data = json_encode($this->orderReference);
+                $order->save();
+            } else {
+                $this->displayMessage(['message' => 'Novalnet webhook received. Order Already Paid']);
+            }
+        }
+
+        \Database::getInstance()->query(
+            'UPDATE tl_iso_product_collection SET notes = CONCAT(IF(notes IS NULL, "", notes), "' . $comments . '") WHERE document_number ="' . $this->orderId . '"'
+        );
+
+        $this->sendWebhookMail($comments);
+        $this->displayMessage(['message' => $comments]);
+    }
+
+    /**
+      * Handle transaction chargeback event
+      *
+      * @return null
+      */
+    public function handleChargeback()
+    {
+        if ($this->orderReference['status'] == 'CONFIRMED' && !empty($this->eventData['transaction']['amount'])) {
+            $comments = sprintf(specialchars($GLOBALS['TL_LANG']['MSC']['nn_webhook_chargeback']), $this->parentTid, $this->receivedAmount, date('d-m-Y'), date('H:i:s'), $this->eventTid).PHP_EOL;
+            \Database::getInstance()->query(
+                'UPDATE tl_iso_product_collection SET notes = CONCAT(IF(notes IS NULL, "", notes), "' . $comments . '") WHERE document_number ="' . $this->orderId . '"'
+            );
+            $this->sendWebhookMail($comments);
+            $this->displayMessage(['message' => $comments]);
+        }
+    }
+
+    /**
+     * Handle instalment cycles
+     *
+     * @param object $order
+     *
+     * @return null
+     */
+    public function handleInstalment($order)
+    {
+        if ($this->eventData['transaction']['status'] == 'CONFIRMED' && !empty($this->eventData['instalment']['cycles_executed'])) {
+            $comments = PHP_EOL.sprintf(specialchars($GLOBALS['TL_LANG']['MSC']['nn_instalment_received']), $this->parentTid, $this->receivedAmount, date('d-m-Y'), $this->eventTid);
+
+            $this->orderReference['instalment_details'] = array_merge($this->orderReference['instalment_details'], ['instalment'.$this->eventData['instalment']['cycles_executed'] => [
+                            'tid' => $this->eventTid,
+                            'paid_date' => date('d-m-Y'),
+                            'next_instalment_date' => $this->eventData['instalment']['next_cycle_date'],
+                             'instalment_cycles_executed' => $this->eventData['instalment']['cycles_executed'],
+                            'due_instalment_cycles'      => $this->eventData['instalment']['pending_cycles'],
+                            'amount'   => $this->receivedAmount
+                            ], 'instalment_cycles_executed' => $this->eventData['instalment']['cycles_executed'] ]);
+
+            $checkoutComments = PHP_EOL . $this->helper->prepareComments($this->eventData, $this->orderId);
+            $comments .= PHP_EOL . PHP_EOL . $this->helper->prepareComments($this->eventData, $this->orderId, false);
+
+            if (!empty($checkoutComments)) {
+                $checkoutInfo = deserialize($order->checkout_info);
+                $checkoutInfo['payment_method']['info'] .= '<br><br>'. nl2br($checkoutComments);
+                $order->checkout_info = serialize($checkoutInfo);
+            }
+
+            \Database::getInstance()->query(
+                'UPDATE tl_iso_product_collection SET notes = CONCAT(IF(notes IS NULL, "", notes), "' . $comments . '") WHERE document_number ="' . $this->orderId . '"'
+            );
+            $this->sendWebhookMail($comments);
+            $this->displayMessage(['message' => $comments]);
+            $order->payment_data = json_encode($this->orderReference);
+            $order->save();
+        }
+    }
+
+    /**
+     * Display the callback message
+     *
+     * @param string $message
+     *
+     * @return null
+     */
+    public function displayMessage($message)
+    {
+        print(json_encode($message));
+        exit;
+    }
+
+    /**
+     * Send notify email after callback process
+     *
+     * @param string $message
+     * @return bool
+     */
+    public function sendWebhookMail($message)
+    {
+        $config = $this->helper->getNovalnetGlobalConfig("novalnetglobalconfigWebHookSendMail");
+        if ($config->novalnetglobalconfigWebHookSendMail) {
+            $objEmail = new \Email();
+            $objEmail->fromName = $GLOBALS['TL_ADMIN_NAME'];
+            $objEmail->from =  $GLOBALS['TL_ADMIN_EMAIL'];
+            $objEmail->subject = 'Novalnet Callback script notification - Order No : ' . $this->orderId;
+            $objEmail->html     = $message;
+            try {
+                return $objEmail->sendTo($config->novalnetglobalconfigWebHookSendMail);
+            } catch (\Exception $e) {
+                \System::log(sprintf('Could not send email for message ID %s: %s', $this->orderId, $e->getMessage()), __METHOD__, TL_ERROR);
+            }
+        }
+    }
+}

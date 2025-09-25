@@ -1,0 +1,30 @@
+*** Changelog ***
+
+= 1.1.0   - 2025.09.25 =
+
+* New - Implemented Online bank transfer and TWINT payment methods
+* New - EPC/SPC QR code Implemented for Prepayment, Invoice, Invoice with payment guarantee, and Instalment by Invoice payments
+* New - Implemented enforce 3D Secure payment for countries outside the EU
+* Enhanced - Offering Guarantee and Instalment payments to B2B customers in Switzerland
+* Enhanced - Extension of Instalment Payment cycles till 36 cycles
+* Enhanced - Callback/Webhook logic updated for efficient handling of Dynamic IPs
+* Removed - Sofort, giropay, and Barzahlen/viacash payment methods
+
+= 1.0.3   - 2025.02.07 =
+
+* Enhanced - Order status configuration for Pending, On-hold, and Cancel status has been implemented
+* Fix - Handling of communication failure for payments
+
+= 1.0.2   - 2024.05.13 =
+
+* Enhanced - Plugin made compatible for Contao 4.9 series
+* Enhanced - Extended support for Symfony 5.4
+
+= 1.0.1   - 2023.10.15 =
+
+* Enhanced - Optimized the payment plugin handling for Shipping Address based on Virtual and Downloadable products
+* Fix - Corrected the order amount format when sending data to the server
+
+= 1.0.0    - 2021.11.12 =
+
+* New Release - Payment bundle implemented with seamless payment experience including one-click payment
